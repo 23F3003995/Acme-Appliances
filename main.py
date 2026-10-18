@@ -302,3 +302,4 @@ async def health():
     return {"status": "ok" if ledger.ready.is_set() else "error", "orders_loaded": len(ledger.orders),
             "error": ledger.last_error,
             "export_url_set": bool(EXPORT_URL), "rates_url_set": bool(RATES_URL), "token_set": bool(AIPIPE_TOKEN)}
+

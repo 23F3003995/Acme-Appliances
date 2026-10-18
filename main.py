@@ -245,7 +245,8 @@ class Ask(BaseModel):
 
 
 @app.post("/")
-async def ask(body: Ask):
+@app.post("/{full_path:path}")  # accept any path, so /ask, /answer, /query etc. all work
+async def ask(body: Ask, full_path: str = ""):
     orders = await ledger.get()
     spec = await question_to_spec(body.question, orders)
     try:

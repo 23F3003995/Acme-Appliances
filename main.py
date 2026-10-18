@@ -66,31 +66,68 @@ def clean_orders(rows: List[dict], usd_per_unit: Dict[str, float]) -> List[dict]
     return out
 
 
+DEFAULT_RATES = {"USD": 1, "EUR": 1.14, "INR": 0.01182}
+
+
+def parse_export(text: str) -> tuple:
+    """Return (rows, next_url). Accepts NDJSON, a JSON array, or a paged {"orders": [...]} object."""
+    text = text.strip()
+    try:
+        data = json.loads(text)
+    except json.JSONDecodeError:
+        return [json.loads(l) for l in text.splitlines() if l.strip()], None
+    if isinstance(data, list):
+        return data, None
+    if isinstance(data, dict) and "orders" in data:
+        return data["orders"], data.get("next")
+    if isinstance(data, dict) and "id" in data:  # a single-line NDJSON file with one row
+        return [data], None
+    raise ValueError("unrecognised export format")
+
+
 class Ledger:
     def __init__(self):
         self.orders: List[dict] = []
         self.ready = asyncio.Event()
         self.lock = asyncio.Lock()
+        self.last_error = ""
 
     async def load(self):
         async with self.lock:
-            async with httpx.AsyncClient(timeout=30) as c:
-                rr, er = await asyncio.gather(c.get(RATES_URL), c.get(EXPORT_URL))
-            rr.raise_for_status(); er.raise_for_status()
-            rates = rr.json()["usd_per_unit"]
-            text = er.text.strip()
-            if text.startswith("["):
-                rows = json.loads(text)
-            elif text.startswith("{") and '"orders"' in text[:200] and "\n" not in text:
-                rows = json.loads(text)["orders"]
-            else:
-                rows = [json.loads(l) for l in text.splitlines() if l.strip()]
-            self.orders = clean_orders(rows, rates)
-            self.ready.set()
+            if self.ready.is_set():
+                return
+            try:
+                async with httpx.AsyncClient(timeout=30, follow_redirects=True) as c:
+                    rates = DEFAULT_RATES
+                    if RATES_URL:
+                        rr = await c.get(RATES_URL)
+                        rr.raise_for_status()
+                        rates = rr.json()["usd_per_unit"]
+                    rows: List[dict] = []
+                    url: Optional[str] = EXPORT_URL
+                    for _ in range(200):  # follows "next" links if the export is paged
+                        er = await c.get(url)
+                        er.raise_for_status()
+                        part, url = parse_export(er.text)
+                        rows.extend(part)
+                        if not url:
+                            break
+                self.orders = clean_orders(rows, rates)
+                self.last_error = ""
+                self.ready.set()
+            except Exception as e:
+                # never put the exception text in output: it can contain the signed URL
+                code = getattr(getattr(e, "response", None), "status_code", "")
+                self.last_error = f"{type(e).__name__} {code}".strip()
+                print("ledger load failed:", self.last_error)
+                raise
 
     async def get(self) -> List[dict]:
         if not self.ready.is_set():
-            await self.load()
+            try:
+                await self.load()
+            except Exception:
+                raise HTTPException(503, f"Ledger not loaded: {self.last_error}")
         return self.orders
 
 
@@ -257,4 +294,11 @@ async def ask(body: Ask, full_path: str = ""):
 
 @app.get("/")
 async def health():
-    return {"status": "ok", "orders_loaded": len(ledger.orders)}
+    if not ledger.ready.is_set():
+        try:
+            await ledger.load()
+        except Exception:
+            pass
+    return {"status": "ok" if ledger.ready.is_set() else "error", "orders_loaded": len(ledger.orders),
+            "error": ledger.last_error,
+            "export_url_set": bool(EXPORT_URL), "rates_url_set": bool(RATES_URL), "token_set": bool(AIPIPE_TOKEN)}

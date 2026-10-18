@@ -263,18 +263,111 @@ async def question_to_spec(question: str, orders: List[dict]) -> dict:
         "response_format": {"type": "json_object"},
         "messages": [{"role": "system", "content": system}, {"role": "user", "content": question}],
     }
-    last_err: Optional[Exception] = None
+    last_err = ""
     async with httpx.AsyncClient(timeout=8) as c:
         for _ in range(2):
             try:
                 r = await c.post(LLM_URL, json=body, headers={"Authorization": f"Bearer {AIPIPE_TOKEN}"})
-                r.raise_for_status()
+                if r.status_code != 200:
+                    last_err = f"HTTP {r.status_code}: {r.text[:200]}"
+                    continue
                 text = r.json()["choices"][0]["message"]["content"]
                 text = re.sub(r"^```(?:json)?|```$", "", text.strip(), flags=re.M).strip()
-                return json.loads(text)
-            except Exception as e:  # retry once
-                last_err = e
-    raise HTTPException(502, f"LLM failed: {last_err}")
+                spec = json.loads(text)
+                if not isinstance(spec, dict):
+                    raise ValueError("spec is not an object")
+                LAST_LLM_ERROR["msg"] = ""
+                return spec
+            except Exception as e:
+                last_err = f"{type(e).__name__}: {str(e)[:150]}"
+    LAST_LLM_ERROR["msg"] = last_err
+    print("LLM failed, using rule-based fallback:", last_err)
+    return None
+
+
+def month_range(y: int, m: int):
+    import calendar
+    return f"{y}-{m:02d}-01", f"{y}-{m:02d}-{calendar.monthrange(y, m)[1]:02d}"
+
+
+def find_month(t: str) -> Optional[int]:
+    names = ["january", "february", "march", "april", "may", "june", "july", "august", "september", "october", "november", "december"]
+    for i, n in enumerate(names, 1):
+        for form in {n, n[:3], "sept" if n == "september" else n}:
+            pat = rf"\b{form}\b"
+            if n == "may":  # "may" is also a verb: require a year or a preposition before it
+                pat = r"(?:\b(?:in|of|during|for|since|until|through|from|to)\s+may\b|\bmay\s+(?:20\d{2}|\d{1,2}(?:st|nd|rd|th)?\b)|\bmay\s*[?.]?\s*$)"
+            if re.search(pat, t):
+                return i
+    return None
+
+
+def rule_based_spec(question: str, orders: List[dict]) -> dict:
+    """Keyword fallback used when the LLM call fails. Covers the common question shapes."""
+    t = question.lower()
+    spec: Dict[str, Any] = {"filters": {}}
+    f = spec["filters"]
+
+    for region in {o["region"] for o in orders}:
+        if re.search(rf"\b{region.lower()}\b", t):
+            f["region"] = region
+    for product in {o["product"] for o in orders}:
+        p = product.lower()
+        if re.search(rf"\b{re.escape(p)}s?\b", t):
+            f["product"] = product
+    m = re.search(r"\bc\d{4}\b", t)
+    if m:
+        f["customer"] = m.group(0).upper()
+
+    year = 2026
+    ym = re.search(r"\b(20\d{2})\b", t)
+    if ym:
+        year = int(ym.group(1))
+    qm = re.search(r"\bq([1-4])\b", t)
+    mm = find_month(t)
+    iso = re.search(r"\b(20\d{2})-(\d{2})\b", t)
+    if qm:
+        q = int(qm.group(1))
+        f["date_from"] = month_range(year, 3 * q - 2)[0]
+        f["date_to"] = month_range(year, 3 * q)[1]
+    elif re.search(r"\bh1\b|first half", t):
+        f["date_from"], f["date_to"] = f"{year}-01-01", f"{year}-06-30"
+    elif re.search(r"\bh2\b|second half", t):
+        f["date_from"], f["date_to"] = f"{year}-07-01", f"{year}-12-31"
+    elif iso:
+        f["date_from"], f["date_to"] = month_range(int(iso.group(1)), int(iso.group(2)))
+    elif mm:
+        f["date_from"], f["date_to"] = month_range(year, mm)
+
+    if "refund" in t:
+        spec["metric"] = "refund_count" if re.search(r"how many|count|number of", t) else "refund_amount_usd"
+    elif re.search(r"average|avg|mean", t):
+        spec["metric"] = "avg_order_value_usd"
+    elif re.search(r"units|quantity|quantities", t):
+        spec["metric"] = "units_sold"
+    elif re.search(r"(distinct|unique|different) customers|how many customers|number of customers", t):
+        spec["metric"] = "unique_customers"
+    elif re.search(r"how many|count|number of", t):
+        spec["metric"] = "order_count"
+    else:
+        spec["metric"] = "revenue_usd"
+
+    g = re.search(r"\bwhich (region|product|customer|month)\b|\b(?:top|best|highest|lowest|most|least)\b.*?\b(region|product|customer|month)s?\b|\bby (region|product|customer|month)\b", t)
+    if g:
+        gb = next(x for x in g.groups() if x)
+        spec["group_by"] = gb
+        f.pop(gb, None)
+        if re.search(r"lowest|least|fewest|smallest|worst|bottom", t):
+            order = "asc"
+        else:
+            order = "desc"
+        n = re.search(r"\b(?:top|bottom)\s+(\d+)", t)
+        if re.search(r"\bwhich\b|\btop\b|\bbest\b|highest|lowest|most|least", t):
+            spec["rank"] = {"order": order, "limit": int(n.group(1)) if n else 1, "return": "key"}
+    return spec
+
+
+LAST_LLM_ERROR = {"msg": ""}
 
 
 class Ask(BaseModel):
@@ -286,6 +379,8 @@ class Ask(BaseModel):
 async def ask(body: Ask, full_path: str = ""):
     orders = await ledger.get()
     spec = await question_to_spec(body.question, orders)
+    if spec is None:
+        spec = rule_based_spec(body.question, orders)
     try:
         return {"answer": run_spec(spec, orders)}
     except Exception as e:
@@ -303,3 +398,11 @@ async def health():
             "error": ledger.last_error,
             "export_url_set": bool(EXPORT_URL), "rates_url_set": bool(RATES_URL), "token_set": bool(AIPIPE_TOKEN)}
 
+
+@app.get("/selftest")
+async def selftest():
+    """Open in a browser to see whether the LLM call works (no secrets shown)."""
+    orders = await ledger.get()
+    spec = await question_to_spec("Total revenue in USD from the North region in March 2026?", orders)
+    return {"llm_ok": spec is not None, "spec": spec, "llm_error": LAST_LLM_ERROR["msg"],
+            "token_set": bool(AIPIPE_TOKEN), "token_len": len(AIPIPE_TOKEN), "model": LLM_MODEL}
